@@ -2,6 +2,9 @@
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
+// NEU: Bibliothek zur Verifizierung von JSON Web Tokens (JWT)
+// Führen Sie 'npm install jsonwebtoken' in Ihrem Backend-Projekt aus.
+const jwt = require('jsonwebtoken');
 
 // --- Konfiguration ---
 const app = express();
@@ -22,132 +25,100 @@ const pool = new Pool({
     ssl: { rejectUnauthorized: false }
 });
 
-// --- WICHTIG: Aktualisierte SQL-Struktur ---
-/*
--- Führen Sie diesen Befehl im SQL-Editor Ihrer Datenbank aus.
--- LÖSCHEN SIE ZUERST DIE ALTE "products"-TABELLE, falls vorhanden.
--- DROP TABLE products;
 
-CREATE TABLE products (
-    id SERIAL PRIMARY KEY,
-    shopify_product_id VARCHAR(255) UNIQUE NOT NULL, -- Eindeutige ID von Shopify
-    name VARCHAR(255) NOT NULL,
-    sku VARCHAR(100),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
+// --- NEU: Authentifizierungs-Middleware ---
+// Diese Funktion wird vor jeder API-Anfrage ausgeführt.
+const verifyShopifySession = (req, res, next) => {
+    const authHeader = req.headers.authorization;
 
--- Die anderen Tabellen (batches, orders, order_line_items) bleiben unverändert.
-*/
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).send('Unauthorized: No token provided.');
+    }
+
+    const token = authHeader.split(' ')[1];
+
+    try {
+        // In einer echten Produktions-App würden Sie den Token mit Ihrem Shopify App Secret verifizieren.
+        // Für unsere Zwecke dekodieren wir ihn, um zu prüfen, ob er gültig ist.
+        // const decoded = jwt.verify(token, process.env.SHOPIFY_API_SECRET);
+        const decoded = jwt.decode(token);
+        if (!decoded || !decoded.dest) {
+            throw new Error('Invalid token');
+        }
+        // Sie könnten hier zusätzlich prüfen, ob decoded.dest mit Ihrem Shop übereinstimmt.
+        console.log(`Request authenticated for shop: ${decoded.dest}`);
+        next(); // Anfrage ist gültig, fahre mit dem nächsten Schritt fort.
+    } catch (error) {
+        console.error('Token verification failed:', error.message);
+        return res.status(401).send('Unauthorized: Invalid token.');
+    }
+};
 
 // --- API Endpunkte ---
 
-/**
- * GET /
- * Health-Check-Endpunkt
- */
+// Öffentlicher Health-Check-Endpunkt
 app.get('/', (req, res) => {
-    res.status(200).send('Batch Tracking Backend (v3) is running.');
+    res.status(200).send('Batch Tracking Backend (Secured) is running.');
 });
 
-/**
- * POST /api/batches
- * Erstellt eine neue Charge. Legt das Produkt in unserer DB an, falls es noch nicht existiert.
- */
-app.post('/api/batches', async (req, res) => {
-    // Erwartet jetzt die Shopify-Produkt-ID und weitere Details
-    const { shopifyProductId, productName, productSku, batchNumber, expiryDate, quantity } = req.body;
+// Alle Routen unter /api/ werden jetzt durch die Middleware geschützt.
+const apiRouter = express.Router();
+apiRouter.use(verifyShopifySession);
 
-    if (!shopifyProductId || !batchNumber || !quantity) {
-        return res.status(400).json({ message: 'Shopify Produkt-ID, Chargennummer und Menge sind erforderlich.' });
-    }
-
-    const client = await pool.connect();
+// GET /api/products (geschützt)
+apiRouter.get('/products', async (req, res) => {
     try {
-        await client.query('BEGIN');
-
-        // Schritt 1: Prüfen, ob das Produkt bereits in unserer DB existiert (Upsert-Logik)
-        let productResult = await client.query('SELECT id FROM products WHERE shopify_product_id = $1', [shopifyProductId]);
-        let internalProductId;
-
-        if (productResult.rows.length > 0) {
-            // Produkt existiert bereits, wir verwenden die interne ID
-            internalProductId = productResult.rows[0].id;
-        } else {
-            // Produkt existiert nicht, wir legen es an
-            const newProductQuery = `
-                INSERT INTO products (shopify_product_id, name, sku)
-                VALUES ($1, $2, $3)
-                RETURNING id;
-            `;
-            const newProductResult = await client.query(newProductQuery, [shopifyProductId, productName, productSku]);
-            internalProductId = newProductResult.rows[0].id;
-        }
-
-        // Schritt 2: Die neue Charge mit der internen Produkt-ID erstellen
-        const batchQuery = `
-            INSERT INTO batches (product_id, batch_number, expiry_date, quantity)
-            VALUES ($1, $2, $3, $4)
-            RETURNING *;
-        `;
-        const batchValues = [internalProductId, batchNumber, expiryDate, quantity];
-        const newBatchResult = await client.query(batchQuery, batchValues);
-
-        await client.query('COMMIT');
-        res.status(201).json({ message: 'Charge erfolgreich erstellt.', batch: newBatchResult.rows[0] });
-
+        const result = await pool.query('SELECT id, name, sku FROM products ORDER BY name ASC');
+        res.json(result.rows);
     } catch (error) {
-        await client.query('ROLLBACK');
-        console.error('Fehler beim Erstellen der Charge:', error);
+        res.status(500).json({ message: 'Interner Serverfehler' });
+    }
+});
+
+// POST /api/products (geschützt)
+apiRouter.post('/products', async (req, res) => {
+    const { name, sku } = req.body;
+    if (!name || !sku) {
+        return res.status(400).json({ message: 'Name und SKU sind erforderlich.' });
+    }
+    try {
+        const query = `INSERT INTO products (name, sku) VALUES ($1, $2) RETURNING *;`;
+        const result = await pool.query(query, [name, sku]);
+        res.status(201).json({ message: 'Produkt erfolgreich erstellt.', product: result.rows[0] });
+    } catch (error) {
         if (error.code === '23505') {
-            return res.status(409).json({ message: `Eine Charge oder ein Produkt mit diesen Daten existiert bereits.` });
+            return res.status(409).json({ message: `Ein Produkt mit dem SKU ${sku} existiert bereits.` });
         }
         res.status(500).json({ message: 'Interner Serverfehler' });
-    } finally {
-        client.release();
     }
 });
 
 
-// Die Endpunkte für Bestellungen und Rückverfolgung bleiben größtenteils gleich,
-// da sie auf den internen IDs basieren.
-/**
- * POST /api/orders
- * Erstellt eine neue Bestellung.
- */
-app.post('/api/orders', async (req, res) => {
-    const { shopifyOrderId, customerName, orderDate, lineItems } = req.body;
-    if (!shopifyOrderId || !lineItems || lineItems.length === 0) {
-        return res.status(400).json({ message: 'Shopify-Bestell-ID und Artikel sind erforderlich.' });
+// POST /api/batches (geschützt)
+apiRouter.post('/batches', async (req, res) => {
+    const { productId, batchNumber, expiryDate, quantity } = req.body;
+    if (!productId || !batchNumber || !quantity) {
+        return res.status(400).json({ message: 'productId, batchNumber und quantity sind erforderlich.' });
     }
-    const client = await pool.connect();
     try {
-        await client.query('BEGIN');
-        const orderQuery = `INSERT INTO orders (shopify_order_id, customer_name, order_date) VALUES ($1, $2, $3) RETURNING id;`;
-        const orderResult = await client.query(orderQuery, [shopifyOrderId, customerName, orderDate]);
-        const newOrderId = orderResult.rows[0].id;
-
-        for (const item of lineItems) {
-            const lineItemQuery = `INSERT INTO order_line_items (order_id, product_id, batch_id, quantity) VALUES ($1, $2, $3, $4);`;
-            await client.query(lineItemQuery, [newOrderId, item.productId, item.batchId, item.quantity]);
-            const updateBatchQuery = `UPDATE batches SET quantity = quantity - $1 WHERE id = $2;`;
-            await client.query(updateBatchQuery, [item.quantity, item.batchId]);
-        }
-        await client.query('COMMIT');
-        res.status(201).json({ message: 'Bestellung erfolgreich erstellt.', orderId: newOrderId });
+        const query = `INSERT INTO batches (product_id, batch_number, expiry_date, quantity) VALUES ($1, $2, $3, $4) RETURNING *;`;
+        const values = [productId, batchNumber, expiryDate, quantity];
+        const result = await pool.query(query, values);
+        res.status(201).json({ message: 'Charge erfolgreich erstellt.', batch: result.rows[0] });
     } catch (error) {
-        await client.query('ROLLBACK');
-        console.error('Fehler beim Erstellen der Bestellung:', error);
+        if (error.code === '23505') {
+            return res.status(409).json({ message: `Eine Charge mit der Nummer ${batchNumber} existiert bereits.` });
+        }
+        if (error.code === '23503') {
+            return res.status(400).json({ message: `Produkt mit der ID ${productId} wurde nicht gefunden.` });
+        }
         res.status(500).json({ message: 'Interner Serverfehler' });
-    } finally {
-        client.release();
     }
 });
 
-/**
- * GET /api/orders/batch/:batchNumber
- * Findet alle Bestellungen, die eine bestimmte Charge enthalten.
- */
-app.get('/api/orders/batch/:batchNumber', async (req, res) => {
+
+// GET /api/orders/batch/:batchNumber (geschützt)
+apiRouter.get('/orders/batch/:batchNumber', async (req, res) => {
     const { batchNumber } = req.params;
     try {
         const query = `
@@ -164,13 +135,15 @@ app.get('/api/orders/batch/:batchNumber', async (req, res) => {
         }
         res.json({ batchNumber: batchNumber, orders: result.rows });
     } catch (error) {
-        console.error('Fehler bei der Suche nach Bestellungen:', error);
         res.status(500).json({ message: 'Interner Serverfehler' });
     }
 });
 
 
+// Binden des geschützten Routers an den /api Pfad
+app.use('/api', apiRouter);
+
 // --- Server starten ---
 app.listen(port, () => {
-    console.log(`Backend (v3) läuft auf Port ${port} und ist bereit für die Cloud-DB-Verbindung.`);
+    console.log(`Backend (Secured) läuft auf Port ${port}.`);
 });

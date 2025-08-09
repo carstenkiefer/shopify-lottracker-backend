@@ -40,7 +40,8 @@ app.get('/api/auth', (req, res) => {
     if (!shop) {
         return res.status(400).send('Missing shop parameter.');
     }
-    const scopes = 'read_products'; // Die Berechtigungen, die wir benötigen
+    // AKTUALISIERT: Zusätzliche Berechtigungen hinzugefügt
+    const scopes = 'read_products,read_orders,write_products'; // Die Berechtigungen, die wir benötigen
     const redirectUri = `https://shopify-lottracker-backend.onrender.com/api/auth/callback`;
     const installUrl = `https://${shop}/admin/oauth/authorize?client_id=${SHOPIFY_API_KEY}&scope=${scopes}&redirect_uri=${redirectUri}`;
     res.redirect(installUrl);

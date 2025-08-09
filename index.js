@@ -117,13 +117,68 @@ const verifyShopifySession = (req, res, next) => {
     try {
         const decoded = jwt.decode(token);
         if (!decoded || !decoded.dest) throw new Error('Invalid token');
-        console.log(`Request authenticated for shop: ${decoded.dest}`);
+        // dest ist i.d.R. "https://{shopDomain}"
+        const shopUrl = decoded.dest;
+        const hostname = new URL(shopUrl).hostname; // z.B. myshop.myshopify.com
+        req.shopDomain = hostname;                  // für nachfolgende Routen verfügbar
+        console.log(`Request authenticated for shop: ${hostname}`);
         next();
     } catch (error) {
         return res.status(401).send({ message: 'Unauthorized: Invalid token.' });
     }
 };
 apiRouter.use(verifyShopifySession);
+
++// POST /api/graphql  -> Proxy zur Shopify GraphQL Admin API
++apiRouter.post('/graphql', async (req, res) => {
+  try {
+    const { query, variables } = req.body || {};
+    if (!query) {
+      return res.status(400).json({ message: 'Missing GraphQL query.' });
+    }
+    // Access Token für den Shop aus DB holen
+    const shop = req.shopDomain; // aus Middleware
+    const { rows } = await pool.query(
+      'SELECT access_token FROM installations WHERE shop = $1 LIMIT 1',
+      [shop]
+    );
+    if (!rows.length) {
+      return res.status(403).json({ message: `No installation for shop ${shop}` });
+    }
+    const accessToken = rows[0].access_token;
+    // An Shopify GraphQL Admin API weiterleiten
+    // Wähle eine passende API-Version (hier Beispiel 2024-07)
+    const apiVersion = '2024-07';
+    const shopifyUrl = `https://${shop}/admin/api/${apiVersion}/graphql.json`;
+    const rsp = await axios.post(
+      shopifyUrl,
+      { query, variables: variables || {} },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Shopify-Access-Token': accessToken,
+        },
+        // Optional: Timeout, damit hängende Requests nicht ewig warten
+        timeout: 15000,
+      }
+    );
+    // JSON 1:1 durchreichen
+    return res.status(200).json(rsp.data);
+  } catch (err) {
+    if (err.response) {
+      // Shopify-Fehler durchreichen (mit kleinem Ausschnitt für Debug)
+      const status = err.response.status || 500;
+      const data = err.response.data;
+      console.error('Shopify GraphQL error:', status, JSON.stringify(data)?.slice(0, 500));
+      return res.status(status).json(
+        typeof data === 'object' ? data : { message: 'Upstream error', data }
+      );
+    }
+    console.error('GraphQL proxy error:', err.message);
+    return res.status(500).json({ message: 'GraphQL proxy failed', error: err.message });
+  }
+});
+
 
 // POST /api/batches
 apiRouter.post('/batches', async (req, res) => {

@@ -23,16 +23,30 @@ const pool = new Pool({
 
 // --- SQL-Struktur ---
 /*
--- Führen Sie diesen Befehl im SQL-Editor Ihrer Datenbank aus, um die neue Tabelle zu erstellen.
+-- Stellen Sie sicher, dass Ihre Tabellen diese Struktur haben.
 CREATE TABLE IF NOT EXISTS installations (
     shop VARCHAR(255) PRIMARY KEY,
     access_token VARCHAR(255) NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
--- Stellen Sie sicher, dass auch die anderen Tabellen (products, batches, etc.) existieren.
+CREATE TABLE IF NOT EXISTS products (
+    id SERIAL PRIMARY KEY,
+    shopify_product_id VARCHAR(255) UNIQUE NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    sku VARCHAR(100),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS batches (
+    id SERIAL PRIMARY KEY,
+    product_id INTEGER NOT NULL REFERENCES products(id),
+    batch_number VARCHAR(100) UNIQUE NOT NULL,
+    expiry_date DATE,
+    quantity INTEGER NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
 */
 
-// --- Authentifizierungs-Logik ---
+// --- Authentifizierungs-Logik (Öffentliche Routen) ---
 
 // Schritt 1: Start der Installation. Leitet den Nutzer zu Shopify.
 app.get('/api/auth', (req, res) => {
@@ -171,9 +185,12 @@ apiRouter.get('/orders/batch/:batchNumber', async (req, res) => {
     }
 });
 
-
 app.use('/api', apiRouter);
 
+// --- KORRIGIERT: Öffentlicher Health-Check für die Haupt-URL ---
+app.get('/', (req, res) => {
+    res.status(200).send('Batch Tracking Backend (v5) is running.');
+});
 
 // --- Server starten ---
 app.listen(port, () => console.log(`Backend (v5 mit OAuth) läuft auf Port ${port}.`));

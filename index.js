@@ -83,8 +83,9 @@ app.get('/api/auth/callback', async (req, res) => {
         `;
         await pool.query(storeQuery, [shop, accessToken]);
 
+        // KORREKTUR: Der App-Name wurde an Ihre URL angepasst.
         // Schritt 5: Nutzer zur App im Shopify Admin weiterleiten
-        res.redirect(`https://${shop}/admin/apps/shopify-lottracker-frontend`);
+        res.redirect(`https://${shop}/admin/apps/zurifoods-lottracker`);
 
     } catch (error) {
         console.error('Error getting access token:', error.response ? error.response.data : error.message);

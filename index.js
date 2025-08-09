@@ -91,6 +91,20 @@ app.get('/', (req, res) => {
     res.status(200).send('Batch Tracking Backend is running and connected to cloud database.');
 });
 
+/**
+ * NEU: GET /api/products
+ * Ruft eine Liste aller Produkte aus der Datenbank ab.
+ */
+app.get('/api/products', async (req, res) => {
+    try {
+        const result = await pool.query('SELECT id, name, sku FROM products ORDER BY name ASC');
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Fehler beim Abrufen der Produkte:', error);
+        res.status(500).json({ message: 'Interner Serverfehler' });
+    }
+});
+
 
 /**
  * POST /api/batches
@@ -115,8 +129,12 @@ app.post('/api/batches', async (req, res) => {
         res.status(201).json({ message: 'Charge erfolgreich erstellt.', batch: result.rows[0] });
     } catch (error) {
         console.error('Fehler beim Erstellen der Charge:', error);
-        if (error.code === '23505') { // unique_violation
+        // VERBESSERTE FEHLERBEHANDLUNG
+        if (error.code === '23505') { // unique_violation for batch_number
             return res.status(409).json({ message: `Eine Charge mit der Nummer ${batchNumber} existiert bereits.` });
+        }
+        if (error.code === '23503') { // foreign_key_violation for product_id
+            return res.status(400).json({ message: `Produkt mit der ID ${productId} wurde nicht gefunden.` });
         }
         res.status(500).json({ message: 'Interner Serverfehler' });
     }

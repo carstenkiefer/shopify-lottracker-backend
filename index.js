@@ -1,463 +1,811 @@
-// --- Imports ---
-const express = require('express');
-const cors = require('cors');
-const { Pool } = require('pg');
-const jwt = require('jsonwebtoken');
-const crypto = require('crypto');
-const axios = require('axios');
+// src/App.js
+import React, { useState, useCallback, useEffect, useMemo } from 'react';
 
-const app = express();
-const port = process.env.PORT || 3000;
-const { SHOPIFY_API_KEY, SHOPIFY_API_SECRET, DATABASE_URL } = process.env;
+// Polaris
+import {
+  Page,
+  Card,
+  Form,
+  TextField,
+  Button,
+  Navigation,
+  DataTable,
+  Frame,
+  TopBar,
+  Banner,
+  Spinner,
+  Select,
+  Layout,
+  Modal,
+  Text,
+  IndexTable,
+  Badge,
+  InlineStack,
+  Box,
+  Divider,
+  EmptyState,
+} from '@shopify/polaris';
+import '@shopify/polaris/build/esm/styles.css';
 
-// --- DB ---
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-});
+// App Bridge v4
+import { useAppBridge } from '@shopify/app-bridge-react';
 
-// ======================================================================
-// 1) WEBHOOK: orders/create  (raw body + HMAC-Verify)
-// ======================================================================
-// ACHTUNG: webhook-Route COMES BEFORE app.use(express.json())
-app.post('/webhooks/orders/create', express.raw({ type: 'application/json' }), async (req, res) => {
-  try {
-    const hmacHeader = req.get('x-shopify-hmac-sha256') || '';
-    const shopDomain = req.get('x-shopify-shop-domain'); // z.B. myshop.myshopify.com
-    const topic = req.get('x-shopify-topic'); // "orders/create"
+function MyApp() {
+  const shopify = useAppBridge();
 
-    if (!shopDomain || !hmacHeader) {
-      return res.status(400).send('Missing headers');
+  // Seiten
+  const [currentPage, setCurrentPage] = useState('batches'); // 'batches' | 'products' | 'traceability'
+
+  // Externe Backend-URL
+  const BACKEND_URL = 'https://shopify-lottracker-backend.onrender.com';
+
+  // --- Produkte (für Auswahl/Übersicht) ---
+  const [shopifyProducts, setShopifyProducts] = useState([]); // Select-Options [{label,value}]
+  const [productsTable, setProductsTable] = useState([]);     // [{id,title,sku}]
+  const [selectedProduct, setSelectedProduct] = useState(null); // {id,title,sku}
+
+  // --- Formular "Neue Charge" (global + produktbezogen) ---
+  const [selectedShopifyProduct, setSelectedShopifyProduct] = useState('');
+  const [batchNumber, setBatchNumber] = useState('');
+  const [expiryDate, setExpiryDate] = useState('');
+  const [quantity, setQuantity] = useState('');
+  const [expiryTouched, setExpiryTouched] = useState(false); // verhindert Überschreiben nach manueller Änderung
+  const [expirySuggested, setExpirySuggested] = useState(false); // UI-Hinweis
+
+  // --- Chargenverwaltung ---
+  const [batches, setBatches] = useState([]); // vom Backend
+  const [loadingBatches, setLoadingBatches] = useState(false);
+
+  const [editModalOpen, setEditModalOpen] = useState(false);
+  const [batchToEdit, setBatchToEdit] = useState(null);
+
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const [batchToDelete, setBatchToDelete] = useState(null);
+
+  // --- Rückverfolgung ---
+  const [searchBatch, setSearchBatch] = useState('');
+  const [traceResults, setTraceResults] = useState([]);
+
+  // --- Allgemein ---
+  const [loading, setLoading] = useState(false);
+  const [notification, setNotification] = useState(null); // {status: 'success'|'critical', message: string}
+
+  // --------------------------------------------------------------------
+  // Helpers
+  // --------------------------------------------------------------------
+  const getIdToken = useCallback(async () => {
+    if (!shopify || typeof shopify.idToken !== 'function') {
+      throw new Error('Shopify App Bridge ist nicht initialisiert.');
     }
-    if (topic && topic.toLowerCase() !== 'orders/create') {
-      // Optional: Nur orders/create akzeptieren
-      return res.status(200).send('Ignored topic');
+    try {
+      return await shopify.idToken();
+    } catch (err) {
+      console.error('idToken Fehler:', err);
+      throw new Error('Authentifizierung fehlgeschlagen.');
     }
+  }, [shopify]);
 
-    // HMAC prüfen
-    const digest = crypto
-      .createHmac('sha256', SHOPIFY_API_SECRET)
-      .update(req.body, 'utf8')
-      .digest('base64');
-
-    // timing-safe Vergleich
-    const safeEqual =
-      hmacHeader.length === digest.length &&
-      crypto.timingSafeEqual(Buffer.from(hmacHeader, 'base64'), Buffer.from(digest, 'base64'));
-
-    if (!safeEqual) {
-      return res.status(401).send('Invalid HMAC');
-    }
-
-    // Payload parsen (nach HMAC!)
-    const order = JSON.parse(req.body.toString('utf8'));
-
-    // Mapping Order → internes Format für processOrder()
-    const shopifyOrderId = String(order.id);
-    const customerName =
-      order?.customer ? `${order.customer.first_name || ''} ${order.customer.last_name || ''}`.trim() : (order?.email || 'Unbekannt');
-    const orderDate = order.created_at || new Date().toISOString();
-
-    // Line Items: REST liefert numeric IDs -> wir formen GraphQL GIDs: gid://shopify/Product/{product_id}
-    const lineItems = (order.line_items || [])
-      .filter((li) => li.product_id) // nur Items mit Produktbezug
-      .map((li) => ({
-        shopifyProductId: `gid://shopify/Product/${li.product_id}`,
-        productName: li.title || li.name || '',
-        productSku: li.sku || '',
-        quantity: parseInt(li.quantity, 10) || 0,
-      }))
-      .filter((li) => li.quantity > 0);
-
-    if (!lineItems.length) {
-      // Nichts zu verbuchen → trotzdem 200, damit Shopify nicht retried
-      return res.status(200).send('No usable line items');
-    }
-
-    // Gleiche Logik wie bei /api/orders
-    await processOrder(shopDomain, {
-      shopifyOrderId,
-      customerName,
-      orderDate,
-      lineItems,
-    });
-
-    // Shopify will 200 OK schnell zurück
-    return res.status(200).send('Processed');
-  } catch (err) {
-    console.error('Webhook orders/create error:', err?.response?.data || err.message);
-    // 200 zurückgeben, um Retries zu vermeiden – alternativ 500, wenn du bewusst Retries willst
-    return res.status(200).send('OK');
-  }
-});
-
-// ======================================================================
-// 2) Globale Middleware (nach dem Webhook!)
-// ======================================================================
-app.use(cors());
-app.use(express.json());
-
-// ======================================================================
-// 3) Helper: Shopify Admin GraphQL
-// ======================================================================
-const makeShopifyApiCall = async (shop, query, variables = {}) => {
-  const dbResult = await pool.query('SELECT access_token FROM installations WHERE shop = $1 LIMIT 1', [shop]);
-  if (dbResult.rows.length === 0) {
-    throw new Error(`Keine Installation für den Shop ${shop} gefunden.`);
-  }
-  const accessToken = dbResult.rows[0].access_token;
-  const apiUrl = `https://${shop}/admin/api/2023-10/graphql.json`;
-
-  const response = await axios.post(
-    apiUrl,
-    { query, variables },
-    {
-      headers: {
+  const fetchWithAuth = useCallback(
+    async (url, options = {}) => {
+      const token = await getIdToken();
+      const headers = {
         'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': accessToken,
-      },
-      timeout: 15000,
-    }
+        Authorization: `Bearer ${token}`,
+        ...(options.headers || {}),
+      };
+
+      const response = await fetch(url, { ...options, headers });
+
+      const status = response.status;
+      const ct = response.headers.get('content-type') || '';
+      const raw = await response.text().catch(() => '');
+
+      if (!response.ok) {
+        console.error('API error:', status, raw?.slice(0, 500));
+        try {
+          const parsed = raw ? JSON.parse(raw) : null;
+          const msg = parsed?.message || parsed?.error || raw || 'Unbekannter Fehler';
+          const err = new Error(msg);
+          err.status = status;
+          throw err;
+        } catch (_) {
+          const err = new Error(`API ${status} – ${raw?.slice(0, 200) || 'keine Antwort'}`);
+          err.status = status;
+          throw err;
+        }
+      }
+
+      if (!ct.includes('application/json')) {
+        console.error('Unerwarteter Content-Type (kein JSON):', ct, raw?.slice(0, 500));
+        throw new Error('Unerwartete Antwort vom Server (kein JSON).');
+      }
+
+      try {
+        return JSON.parse(raw);
+      } catch (e) {
+        console.error('JSON-Parse-Fehler:', e, 'Roh-Body:', raw?.slice(0, 500));
+        throw new Error('Antwort konnte nicht als JSON geparst werden.');
+      }
+    },
+    [getIdToken]
   );
-  return response.data;
-};
 
-// ======================================================================
-// 4) Order-Verarbeitung extrahiert -> von Webhook & /api/orders nutzbar
-// ======================================================================
-async function processOrder(shop, payload) {
-  const { shopifyOrderId, customerName, orderDate, lineItems } = payload;
+  // --------------------------------------------------------------------
+  // Shopify GraphQL: Produkte laden
+  // --------------------------------------------------------------------
+  const fetchProductsFromShopify = useCallback(async () => {
+    setLoading(true);
+    try {
+      const token = await getIdToken();
 
-  if (!shopifyOrderId || !Array.isArray(lineItems) || lineItems.length === 0) {
-    throw new Error('Invalid order payload');
-  }
-
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    // Bestellung anlegen
-    const orderResult = await client.query(
-      `INSERT INTO orders (shopify_order_id, customer_name, order_date)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (shopify_order_id) DO NOTHING
-       RETURNING id;`,
-      [shopifyOrderId, customerName || null, orderDate || new Date().toISOString()]
-    );
-
-    // Falls Order bereits existierte (ON CONFLICT), hole id
-    let newOrderId;
-    if (orderResult.rows.length) {
-      newOrderId = orderResult.rows[0].id;
-    } else {
-      const existing = await client.query('SELECT id FROM orders WHERE shopify_order_id = $1', [shopifyOrderId]);
-      newOrderId = existing.rows[0].id;
-    }
-
-    for (const item of lineItems) {
-      let quantityToFulfill = item.quantity;
-
-      // Produkt-ID sicherstellen oder neu anlegen
-      let productInfo = await client.query('SELECT id, sku FROM products WHERE shopify_product_id = $1', [item.shopifyProductId]);
-      if (productInfo.rows.length === 0) {
-        const ins = await client.query(
-          `INSERT INTO products (shopify_product_id, name, sku) VALUES ($1, $2, $3) RETURNING id, sku;`,
-          [item.shopifyProductId, item.productName || null, item.productSku || null]
-        );
-        productInfo = ins;
-      }
-      const internalProductId = productInfo.rows[0].id;
-      const productSku = productInfo.rows[0].sku;
-
-      // FIFO: vorhandene Chargen mit Restmenge
-      const batchesResult = await client.query(
-        'SELECT id, quantity FROM batches WHERE product_id = $1 AND quantity > 0 ORDER BY expiry_date ASC NULLS LAST, created_at ASC',
-        [internalProductId]
-      );
-
-      for (const batch of batchesResult.rows) {
-        if (quantityToFulfill <= 0) break;
-        const pick = Math.min(quantityToFulfill, batch.quantity);
-        await client.query('UPDATE batches SET quantity = quantity - $1 WHERE id = $2', [pick, batch.id]);
-        await client.query(
-          'INSERT INTO order_line_items (order_id, product_id, batch_id, quantity) VALUES ($1, $2, $3, $4)',
-          [newOrderId, internalProductId, batch.id, pick]
-        );
-        quantityToFulfill -= pick;
-      }
-
-      if (quantityToFulfill > 0) {
-        // Metafelder vom Produkt holen
-        const query = `
-          query ($id: ID!) {
-            product(id: $id) {
-              shelfLife: metafield(namespace: "custom", key: "default_shelf_life_days") { value }
-              batchQuantity: metafield(namespace: "custom", key: "default_batch_quantity") { value }
+      const graphqlQuery = {
+        query: `{
+          products(first: 50) {
+            edges {
+              node {
+                id
+                title
+                variants(first: 1) { edges { node { sku } } }
+              }
             }
           }
-        `;
-        const apiResponse = await makeShopifyApiCall(shop, query, { id: item.shopifyProductId });
-        const shelfLifeDays = apiResponse?.data?.product?.shelfLife?.value;
-        const defaultBatchQuantity = apiResponse?.data?.product?.batchQuantity?.value;
+        }`,
+        variables: {},
+      };
 
-        const now = new Date();
-        const newBatchNumber = `${productSku || 'PROD'}-${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(
-          now.getDate()
-        ).padStart(2, '0')}-${now.getTime()}`;
+      const response = await fetch(`${BACKEND_URL}/api/graphql`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(graphqlQuery),
+      });
 
-        let newExpiryDate = null;
-        if (shelfLifeDays) {
-          now.setDate(now.getDate() + parseInt(shelfLifeDays, 10));
-          newExpiryDate = now.toISOString().split('T')[0];
+      const status = response.status;
+      const ct = response.headers.get('content-type') || '';
+      const raw = await response.text().catch(() => '');
+
+      if (!response.ok) {
+        console.error('GraphQL error:', status, raw?.slice(0, 500));
+        throw new Error(`GraphQL ${status} – ${raw?.slice(0, 200) || 'keine Antwort'}`);
+      }
+      if (!ct.includes('application/json')) {
+        console.error('GraphQL: Kein JSON:', ct, raw?.slice(0, 500));
+        throw new Error('Unerwartete Antwort vom Server (kein JSON).');
+      }
+
+      const jsonResponse = JSON.parse(raw);
+      const edges = jsonResponse?.data?.products?.edges || [];
+
+      // Select-Options + Tabelle befüllen
+      const productOptions = edges.map((edge) => {
+        const sku = edge?.node?.variants?.edges?.[0]?.node?.sku || 'N/A';
+        return { label: `${edge.node.title} (SKU: ${sku})`, value: edge.node.id };
+      });
+      setShopifyProducts(productOptions);
+
+      const list = edges.map((edge) => {
+        const sku = edge?.node?.variants?.edges?.[0]?.node?.sku || 'N/A';
+        return { id: edge.node.id, title: edge.node.title, sku };
+      });
+      setProductsTable(list);
+    } catch (error) {
+      console.error(error);
+      setNotification({ status: 'critical', message: 'Shopify-Produkte konnten nicht geladen werden.' });
+    } finally {
+      setLoading(false);
+    }
+  }, [BACKEND_URL, getIdToken]);
+
+  // --------------------------------------------------------------------
+  // Chargenverwaltung – Laden, Erstellen, Bearbeiten, Löschen
+  // --------------------------------------------------------------------
+  const loadBatches = useCallback(async () => {
+    setLoadingBatches(true);
+    try {
+      const data = await fetchWithAuth(`${BACKEND_URL}/api/batches`);
+      setBatches(Array.isArray(data) ? data : data?.batches || []);
+    } catch (error) {
+      console.error(error);
+      setNotification({ status: 'critical', message: 'Chargenliste konnte nicht geladen werden.' });
+    } finally {
+      setLoadingBatches(false);
+    }
+  }, [BACKEND_URL, fetchWithAuth]);
+
+  useEffect(() => {
+    fetchProductsFromShopify();
+    loadBatches();
+  }, [fetchProductsFromShopify, loadBatches]);
+
+  // --------------------------------------------------------------------
+  // Metafeld lesen & MHD vorschlagen
+  // --------------------------------------------------------------------
+  const suggestExpiryFromMetafield = useCallback(
+    async (shopifyProductId) => {
+      if (!shopifyProductId) return;
+
+      try {
+        const token = await getIdToken();
+        const gql = {
+          query: `
+            query ($id: ID!) {
+              product(id: $id) {
+                shelfLife: metafield(namespace: "custom", key: "default_shelf_life_days") { value }
+              }
+            }
+          `,
+          variables: { id: shopifyProductId },
+        };
+
+        const resp = await fetch(`${BACKEND_URL}/api/graphql`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify(gql),
+        });
+
+        const text = await resp.text();
+        if (!resp.ok) {
+          console.error('GraphQL error while suggesting expiry:', text?.slice(0, 300));
+          return;
+        }
+        const json = JSON.parse(text);
+        const daysStr = json?.data?.product?.shelfLife?.value;
+        if (!daysStr) {
+          setExpirySuggested(false);
+          return;
         }
 
-        const newBatchQty = defaultBatchQuantity ? parseInt(defaultBatchQuantity, 10) : 100;
-
-        const newBatch = await client.query(
-          'INSERT INTO batches (product_id, batch_number, expiry_date, quantity) VALUES ($1, $2, $3, $4) RETURNING id',
-          [internalProductId, newBatchNumber, newExpiryDate, newBatchQty]
-        );
-        const newBatchId = newBatch.rows[0].id;
-
-        const pickRest = Math.min(quantityToFulfill, newBatchQty);
-        await client.query('UPDATE batches SET quantity = quantity - $1 WHERE id = $2', [pickRest, newBatchId]);
-        await client.query(
-          'INSERT INTO order_line_items (order_id, product_id, batch_id, quantity) VALUES ($1, $2, $3, $4)',
-          [newOrderId, internalProductId, newBatchId, pickRest]
-        );
-
-        quantityToFulfill -= pickRest;
+        const days = parseInt(daysStr, 10);
+        if (Number.isFinite(days) && days > 0 && !expiryTouched) {
+          const base = new Date();
+          base.setHours(12, 0, 0, 0);
+          base.setDate(base.getDate() + days);
+          const iso = base.toISOString().slice(0, 10);
+          setExpiryDate(iso);
+          setExpirySuggested(true);
+        }
+      } catch (e) {
+        console.error('Metafeld-Vorschlag fehlgeschlagen:', e);
       }
+    },
+    [BACKEND_URL, getIdToken, expiryTouched]
+  );
 
-      // Falls quantityToFulfill > 0: Backorder/Rest ungedeckt – hier bewusst ignoriert oder loggen
-      if (quantityToFulfill > 0) {
-        console.warn('Ungedeckte Menge nach Neuanlage von Chargen:', { product: item.shopifyProductId, rest: quantityToFulfill });
+  // Wenn im globalen Formular das Produkt gewechselt wird → MHD vorschlagen (wenn Feld nicht touched)
+  const onSelectProduct = useCallback(
+    (val) => {
+      setSelectedShopifyProduct(val);
+      // Vorschlag nur setzen, wenn MHD nicht manuell verändert wurde
+      if (!expiryTouched) {
+        suggestExpiryFromMetafield(val);
       }
+    },
+    [expiryTouched, suggestExpiryFromMetafield]
+  );
+
+  // Sobald Nutzer MHD editiert → nicht mehr überschreiben
+  const onChangeExpiry = useCallback((val) => {
+    setExpiryTouched(true);
+    setExpirySuggested(false);
+    setExpiryDate(val);
+  }, []);
+
+  // --------------------------------------------------------------------
+  // Neue Charge anlegen
+  // --------------------------------------------------------------------
+  const handleCreateBatch = useCallback(async (explicitProductId) => {
+    const productIdToUse = explicitProductId || selectedShopifyProduct;
+
+    if (!productIdToUse) {
+      setNotification({ status: 'critical', message: 'Bitte wählen Sie ein Produkt aus.' });
+      return;
+    }
+    if (!batchNumber || !quantity) {
+      setNotification({ status: 'critical', message: 'Chargennummer und Menge sind erforderlich.' });
+      return;
+    }
+    setLoading(true);
+    setNotification(null);
+
+    // Produktdetails je nach Aufrufer bestimmen
+    let productLabel = '';
+    if (explicitProductId) {
+      const p = productsTable.find((x) => x.id === explicitProductId);
+      productLabel = p ? `${p.title} (SKU: ${p.sku || 'N/A'})` : '';
+    } else {
+      const p = shopifyProducts.find((x) => x.value === productIdToUse);
+      productLabel = p?.label || '';
     }
 
-    await client.query('COMMIT');
-  } catch (err) {
-    await client.query('ROLLBACK');
-    throw err;
-  } finally {
-    client.release();
-  }
+    const payload = {
+      shopifyProductId: productIdToUse,
+      productName: productLabel.split(' (SKU:')[0] || '',
+      productSku: productLabel.split('SKU: ')[1]?.replace(')', '') || '',
+      batchNumber,
+      expiryDate: expiryDate || null,
+      quantity: parseInt(quantity, 10) || 0,
+    };
+
+    try {
+      const data = await fetchWithAuth(`${BACKEND_URL}/api/batches`, {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      setNotification({ status: 'success', message: `Charge ${data.batch.batch_number} erfolgreich erstellt!` });
+      // Formular zurücksetzen
+      setBatchNumber('');
+      setExpiryDate('');
+      setQuantity('');
+      setSelectedShopifyProduct('');
+      setExpiryTouched(false);
+      setExpirySuggested(false);
+      await loadBatches();
+    } catch (error) {
+      console.error(error);
+      setNotification({ status: 'critical', message: error.message || 'Erstellen fehlgeschlagen.' });
+    } finally {
+      setLoading(false);
+    }
+  }, [selectedShopifyProduct, shopifyProducts, productsTable, batchNumber, expiryDate, quantity, BACKEND_URL, fetchWithAuth, loadBatches]);
+
+  // --------------------------------------------------------------------
+  // Bearbeiten / Löschen
+  // --------------------------------------------------------------------
+  const openEditModal = useCallback((batch) => {
+    setBatchToEdit({
+      id: batch.id,
+      expiry_date: batch.expiry_date ? new Date(batch.expiry_date).toISOString().slice(0, 10) : '',
+      quantity: batch.quantity ?? 0,
+      batch_number: batch.batch_number,
+    });
+    setEditModalOpen(true);
+  }, []);
+  const closeEditModal = useCallback(() => {
+    setEditModalOpen(false);
+    setBatchToEdit(null);
+  }, []);
+
+  const saveEdit = useCallback(async () => {
+    if (!batchToEdit) return;
+    setLoading(true);
+    try {
+      await fetchWithAuth(`${BACKEND_URL}/api/batches/${encodeURIComponent(batchToEdit.id)}`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          expiryDate: batchToEdit.expiry_date || null,
+          quantity: batchToEdit.quantity ? parseInt(batchToEdit.quantity, 10) : 0,
+        }),
+      });
+      setNotification({ status: 'success', message: 'Charge aktualisiert.' });
+      closeEditModal();
+      await loadBatches();
+    } catch (error) {
+      console.error(error);
+      setNotification({ status: 'critical', message: error.message || 'Aktualisierung fehlgeschlagen.' });
+    } finally {
+      setLoading(false);
+    }
+  }, [batchToEdit, BACKEND_URL, fetchWithAuth, loadBatches, closeEditModal]);
+
+  const requestDeleteBatch = useCallback((batch) => {
+    setBatchToDelete(batch);
+    setDeleteConfirmOpen(true);
+  }, []);
+  const closeDeleteConfirm = useCallback(() => {
+    setDeleteConfirmOpen(false);
+    setBatchToDelete(null);
+  }, []);
+
+  const performDelete = useCallback(async () => {
+    if (!batchToDelete) return;
+    setLoading(true);
+    try {
+      // Vorab-Check gegen Orders
+      const batchNum = batchToDelete.batch_number;
+      let hasOrders = false;
+      try {
+        const ordersResp = await fetchWithAuth(`${BACKEND_URL}/api/orders/batch/${encodeURIComponent(batchNum)}`);
+        const orders = Array.isArray(ordersResp?.orders) ? ordersResp.orders : [];
+        hasOrders = orders.length > 0;
+      } catch (e) {
+        if (e?.status && e.status !== 404) throw e; // echte Fehler
+        hasOrders = false; // 404 = keine Bestellungen
+      }
+
+      if (hasOrders) {
+        setNotification({
+          status: 'critical',
+          message: `Diese Charge (${batchNum}) kann nicht gelöscht werden, da bereits Bestellungen vorhanden sind.`,
+        });
+        return;
+      }
+
+      await fetchWithAuth(`${BACKEND_URL}/api/batches/${encodeURIComponent(batchToDelete.id)}`, {
+        method: 'DELETE',
+      });
+
+      setNotification({ status: 'success', message: `Charge ${batchNum} wurde gelöscht.` });
+      await loadBatches();
+    } catch (error) {
+      console.error(error);
+      setNotification({ status: 'critical', message: error.message || 'Löschen fehlgeschlagen.' });
+    } finally {
+      setLoading(false);
+      closeDeleteConfirm();
+    }
+  }, [batchToDelete, BACKEND_URL, fetchWithAuth, loadBatches, closeDeleteConfirm]);
+
+  // --------------------------------------------------------------------
+  // Rückverfolgung
+  // --------------------------------------------------------------------
+  const handleTraceBatch = useCallback(async () => {
+    if (!searchBatch) return;
+    setLoading(true);
+    setNotification(null);
+    setTraceResults([]);
+    try {
+      const data = await fetchWithAuth(`${BACKEND_URL}/api/orders/batch/${encodeURIComponent(searchBatch)}`);
+      setTraceResults(Array.isArray(data.orders) ? data.orders : []);
+    } catch (error) {
+      console.error(error);
+      if (error?.status === 404) {
+        setNotification({ status: 'critical', message: `Keine Bestellungen für Charge ${searchBatch} gefunden.` });
+      } else {
+        setNotification({ status: 'critical', message: error.message || 'Suche fehlgeschlagen.' });
+      }
+    } finally {
+      setLoading(false);
+    }
+  }, [searchBatch, BACKEND_URL, fetchWithAuth]);
+
+  // --------------------------------------------------------------------
+  // Produktbezogene Ansicht (Filterung)
+  // --------------------------------------------------------------------
+  const productBatches = useMemo(() => {
+    if (!selectedProduct) return [];
+    return batches.filter(
+      (b) => b.shopify_product_id && b.shopify_product_id === selectedProduct.id
+    );
+  }, [batches, selectedProduct]);
+
+  // --------------------------------------------------------------------
+  // UI – Navigation
+  // --------------------------------------------------------------------
+  const navigationMarkup = (
+    <Navigation location="/">
+      <Navigation.Section
+        items={[
+          { label: 'Chargen verwalten', onClick: () => setCurrentPage('batches'), selected: currentPage === 'batches' },
+          { label: 'Produkte', onClick: () => setCurrentPage('products'), selected: currentPage === 'products' },
+          { label: 'Rückverfolgung', onClick: () => setCurrentPage('traceability'), selected: currentPage === 'traceability' },
+        ]}
+      />
+    </Navigation>
+  );
+
+  // --- Reusable: Formular "Neue Charge" ---
+  const NewBatchForm = ({ presetProductId, compact = false }) => {
+    const effectiveProductId = presetProductId || selectedShopifyProduct;
+    const disabled = !effectiveProductId || !batchNumber || !quantity || loading;
+
+    // Vorschlag laden, wenn Formular mit presetProductId geöffnet wird oder sich die ID ändert
+    useEffect(() => {
+      if (presetProductId) {
+        // Nur vorschlagen, wenn MHD nicht schon manuell gesetzt wurde
+        if (!expiryTouched) {
+          suggestExpiryFromMetafield(presetProductId);
+        }
+      }
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [presetProductId]);
+
+    return (
+      <Form onSubmit={() => handleCreateBatch(presetProductId)}>
+        {!presetProductId && (
+          <Select
+            label="Shopify Produkt"
+            options={[{ label: 'Produkt aus Ihrem Shop auswählen...', value: '' }, ...shopifyProducts]}
+            onChange={onSelectProduct}
+            value={selectedShopifyProduct}
+          />
+        )}
+        <TextField label="Chargennummer" value={batchNumber} onChange={setBatchNumber} autoComplete="off" />
+        <TextField
+          label="MHD"
+          value={expiryDate}
+          onChange={onChangeExpiry}
+          type="date"
+          autoComplete="off"
+          helpText={expirySuggested ? 'Vorschlag aus Metafeld custom.default_shelf_life_days' : undefined}
+        />
+        <TextField label="Menge" value={quantity} onChange={setQuantity} type="number" autoComplete="off" />
+        <div style={{ marginTop: compact ? 12 : 20 }}>
+          <Button submit primary disabled={disabled}>
+            {loading ? 'Bitte warten…' : 'Charge erstellen'}
+          </Button>
+        </div>
+      </Form>
+    );
+  };
+
+  // --- Tabelle "Angelegte Chargen" ---
+  const BatchesIndexTable = ({ rows }) => (
+    <IndexTable
+      resourceName={{ singular: 'Charge', plural: 'Chargen' }}
+      itemCount={rows.length}
+      selectable={false}
+      headings={[
+        { title: 'Chargennr.' },
+        { title: 'Produkt' },
+        { title: 'SKU' },
+        { title: 'MHD' },
+        { title: 'Menge' },
+        { title: 'Aktionen' },
+      ]}
+    >
+      {rows.map((b, index) => (
+        <IndexTable.Row id={String(b.id)} key={b.id} position={index}>
+          <IndexTable.Cell>
+            <Text as="span" variant="bodyMd" fontWeight="semibold">{b.batch_number}</Text>
+          </IndexTable.Cell>
+          <IndexTable.Cell>
+            <Text as="span" variant="bodyMd">{b.product_name || '—'}</Text>
+          </IndexTable.Cell>
+          <IndexTable.Cell>
+            <Text as="span" variant="bodyMd">{b.sku || '—'}</Text>
+          </IndexTable.Cell>
+          <IndexTable.Cell>
+            <Badge tone={b.expiry_date ? 'success' : 'attention'}>
+              {b.expiry_date ? new Date(b.expiry_date).toLocaleDateString('de-DE') : 'kein Datum'}
+            </Badge>
+          </IndexTable.Cell>
+          <IndexTable.Cell>{b.quantity}</IndexTable.Cell>
+          <IndexTable.Cell>
+            <InlineStack gap="200">
+              <Button size="slim" onClick={() => openEditModal(b)}>Bearbeiten</Button>
+              <Button size="slim" tone="critical" onClick={() => requestDeleteBatch(b)}>Löschen</Button>
+            </InlineStack>
+          </IndexTable.Cell>
+        </IndexTable.Row>
+      ))}
+    </IndexTable>
+  );
+
+  // --- Seite: Chargen verwalten (global) ---
+  const batchPageMarkup = (
+    <Page title="Chargen verwalten">
+      <Layout>
+        <Layout.Section>
+          <Card>
+            <NewBatchForm />
+          </Card>
+        </Layout.Section>
+
+        <Layout.Section>
+          <Card>
+            <Box padding="300">
+              <InlineStack align="space-between" blockAlign="center">
+                <Text as="h3" variant="headingMd">Angelegte Chargen</Text>
+                {loadingBatches && <Spinner size="small" />}
+              </InlineStack>
+            </Box>
+            {batches.length > 0 ? (
+              <BatchesIndexTable rows={batches} />
+            ) : (
+              <EmptyState
+                heading="Noch keine Chargen vorhanden"
+                action={{ content: 'Neue Charge erstellen' }}
+                image=""
+              >
+                <p>Lege die erste Charge über das Formular oben an.</p>
+              </EmptyState>
+            )}
+          </Card>
+        </Layout.Section>
+      </Layout>
+
+      {/* Bearbeiten-Modal */}
+      <Modal
+        open={editModalOpen}
+        onClose={closeEditModal}
+        title={`Charge bearbeiten${batchToEdit?.batch_number ? ` – ${batchToEdit.batch_number}` : ''}`}
+        primaryAction={{ content: 'Speichern', onAction: saveEdit, disabled: loading }}
+        secondaryActions={[{ content: 'Abbrechen', onAction: closeEditModal }]}
+      >
+        <Modal.Section>
+          <Form onSubmit={saveEdit}>
+            <TextField
+              label="MHD"
+              value={batchToEdit?.expiry_date || ''}
+              onChange={(val) => setBatchToEdit((prev) => ({ ...prev, expiry_date: val }))}
+              type="date"
+              autoComplete="off"
+            />
+            <TextField
+              label="Menge"
+              value={String(batchToEdit?.quantity ?? 0)}
+              onChange={(val) => setBatchToEdit((prev) => ({ ...prev, quantity: parseInt(val || '0', 10) }))}
+              type="number"
+              autoComplete="off"
+            />
+          </Form>
+        </Modal.Section>
+      </Modal>
+
+      {/* Löschbestätigung */}
+      <Modal
+        open={deleteConfirmOpen}
+        onClose={closeDeleteConfirm}
+        title="Charge löschen?"
+        primaryAction={{ content: 'Ja, löschen', tone: 'critical', onAction: performDelete, disabled: loading }}
+        secondaryActions={[{ content: 'Abbrechen', onAction: closeDeleteConfirm }]}
+      >
+        <Modal.Section>
+          <Text as="p" variant="bodyMd">
+            {batchToDelete
+              ? `Soll die Charge "${batchToDelete.batch_number}" wirklich gelöscht werden?`
+              : 'Soll diese Charge wirklich gelöscht werden?'}
+          </Text>
+          <Box paddingBlockStart="200">
+            <Badge tone="critical">Achtung</Badge>{' '}
+            <Text as="span" variant="bodySm">
+              Löschen ist nicht möglich, wenn bereits Bestellungen zugeordnet sind. Das wird vorab geprüft und zusätzlich
+              serverseitig verhindert.
+            </Text>
+          </Box>
+        </Modal.Section>
+      </Modal>
+    </Page>
+  );
+
+  // --- Seite: Produkte (mit produktbezogener Charge-Anlage & Liste) ---
+  const productsPageMarkup = (
+    <Page title="Produkte">
+      <Layout>
+        <Layout.Section>
+          <Card>
+            <DataTable
+              columnContentTypes={['text', 'text', 'text']}
+              headings={['Titel', 'SKU', 'Aktionen']}
+              rows={productsTable.map((p) => [
+                p.title,
+                p.sku,
+                <Button onClick={() => {
+                  setSelectedProduct(p);
+                  // Vorschlag fürs MHD direkt vorbereiten (nur wenn noch nicht touched)
+                  if (!expiryTouched) suggestExpiryFromMetafield(p.id);
+                }}>
+                  Chargen anzeigen
+                </Button>,
+              ])}
+            />
+          </Card>
+        </Layout.Section>
+
+        <Layout.Section>
+          <Card title="Chargen zum ausgewählten Produkt">
+            {!selectedProduct ? (
+              <Box padding="400">
+                <Text as="p" variant="bodyMd">Bitte ein Produkt oben auswählen.</Text>
+              </Box>
+            ) : (
+              <>
+                <Box padding="400">
+                  <InlineStack align="space-between" blockAlign="center">
+                    <div>
+                      <Text as="h3" variant="headingMd">{selectedProduct.title}</Text>
+                      <Text as="p" variant="bodySm">SKU: {selectedProduct.sku || '—'}</Text>
+                    </div>
+                    <div>
+                      <Button onClick={() => setSelectedProduct(null)} plain>Auswahl zurücksetzen</Button>
+                    </div>
+                  </InlineStack>
+                </Box>
+
+                <Divider />
+
+                <Box padding="400">
+                  <Text as="h4" variant="headingSm">Neue Charge für dieses Produkt anlegen</Text>
+                </Box>
+                <Box paddingInline="400" paddingBlockEnd="400">
+                  {/* Gleiches Formular, aber mit presetProductId → MHD Vorschlag wird via useEffect geholt */}
+                  <NewBatchForm presetProductId={selectedProduct.id} compact />
+                </Box>
+
+                <Divider />
+
+                <Box padding="400">
+                  <Text as="h4" variant="headingSm">Vorhandene Chargen</Text>
+                </Box>
+                {productBatches.length > 0 ? (
+                  <BatchesIndexTable rows={productBatches} />
+                ) : (
+                  <Box padding="400">
+                    <Text as="p" variant="bodyMd">Für dieses Produkt sind noch keine Chargen vorhanden.</Text>
+                  </Box>
+                )}
+              </>
+            )}
+          </Card>
+        </Layout.Section>
+      </Layout>
+    </Page>
+  );
+
+  // --- Seite: Rückverfolgung ---
+  const traceabilityPageMarkup = (
+    <Page title="Charge zurückverfolgen">
+      <Card>
+        <Form onSubmit={handleTraceBatch}>
+          <TextField
+            label="Chargennummer suchen"
+            value={searchBatch}
+            onChange={setSearchBatch}
+            autoComplete="off"
+          />
+          <div style={{ marginTop: 12 }}>
+            <Button submit primary disabled={loading || !searchBatch}>
+              {loading ? 'Suche…' : 'Suchen'}
+            </Button>
+          </div>
+        </Form>
+      </Card>
+      {traceResults.length > 0 && (
+        <Card>
+          <DataTable
+            columnContentTypes={['text', 'text', 'text', 'text', 'numeric']}
+            headings={['Bestell-ID', 'Kunde', 'Bestelldatum', 'Produkt', 'Menge']}
+            rows={traceResults.map((order) => [
+              order.orderId,
+              order.customer,
+              new Date(order.date).toLocaleDateString('de-DE'),
+              order.productName,
+              order.quantity,
+            ])}
+          />
+        </Card>
+      )}
+    </Page>
+  );
+
+  const notificationBanner =
+    notification ? (
+      <Banner
+        title={notification.status === 'success' ? 'Erfolg' : 'Fehler'}
+        status={notification.status}
+        onDismiss={() => setNotification(null)}
+      >
+        <p>{notification.message}</p>
+      </Banner>
+    ) : null;
+
+  return (
+    <Frame topBar={<TopBar />} navigation={navigationMarkup}>
+      {notificationBanner}
+      {loading && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            display: 'grid',
+            placeItems: 'center',
+            background: 'rgba(255,255,255,0.35)',
+            zIndex: 999,
+          }}
+        >
+          <Spinner />
+        </div>
+      )}
+      {currentPage === 'batches' && batchPageMarkup}
+      {currentPage === 'products' && productsPageMarkup}
+      {currentPage === 'traceability' && traceabilityPageMarkup}
+    </Frame>
+  );
 }
 
-// ======================================================================
-// 5) Geschützte API (App Bridge JWT) – GraphQL-Proxy & CRUD
-// ======================================================================
-const apiRouter = express.Router();
-
-// JWT-Check von App Bridge (Frontend)
-const verifyShopifySession = (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith('Bearer ')) {
-    return res.status(401).send({ message: 'Unauthorized: No token provided.' });
-  }
-  const token = authHeader.split(' ')[1];
-  try {
-    const decoded = jwt.decode(token);
-    if (!decoded || !decoded.dest) throw new Error('Invalid token');
-    const hostname = new URL(decoded.dest).hostname; // myshop.myshopify.com
-    req.shop = hostname;
-    next();
-  } catch (error) {
-    return res.status(401).send({ message: 'Unauthorized: Invalid token.' });
-  }
-};
-apiRouter.use(verifyShopifySession);
-
-// GraphQL-Proxy
-apiRouter.post('/graphql', async (req, res) => {
-  try {
-    const { query, variables } = req.body || {};
-    if (!query) return res.status(400).json({ message: 'Missing GraphQL query.' });
-    const data = await makeShopifyApiCall(req.shop, query, variables || {});
-    return res.status(200).json(data);
-  } catch (err) {
-    if (err.response) {
-      const status = err.response.status || 500;
-      return res.status(status).json(
-        typeof err.response.data === 'object' ? err.response.data : { message: 'Upstream error', data: err.response.data }
-      );
-    }
-    console.error('GraphQL proxy error:', err.message);
-    return res.status(500).json({ message: 'GraphQL proxy failed', error: err.message });
-  }
-});
-
-// POST /api/batches (bestehend – nutzt ggf. Metafeld shelf life)
-apiRouter.post('/batches', async (req, res) => {
-  const { shopifyProductId, productName, productSku, batchNumber, expiryDate, quantity } = req.body;
-  const { shop } = req;
-
-  if (!shopifyProductId || !batchNumber || !quantity) {
-    return res.status(400).json({ message: 'Shopify Produkt-ID, Chargennummer und Menge sind erforderlich.' });
-  }
-
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    let productResult = await client.query('SELECT id FROM products WHERE shopify_product_id = $1', [shopifyProductId]);
-    let internalProductId;
-
-    if (productResult.rows.length > 0) {
-      internalProductId = productResult.rows[0].id;
-    } else {
-      const ins = await client.query(
-        `INSERT INTO products (shopify_product_id, name, sku) VALUES ($1, $2, $3) RETURNING id;`,
-        [shopifyProductId, productName || null, productSku || null]
-      );
-      internalProductId = ins.rows[0].id;
-    }
-
-    let finalExpiryDate = expiryDate || null;
-    if (!finalExpiryDate) {
-      const query = `
-        query ($id: ID!) {
-          product(id: $id) {
-            shelfLife: metafield(namespace: "custom", key: "default_shelf_life_days") { value }
-          }
-        }
-      `;
-      const apiResponse = await makeShopifyApiCall(shop, query, { id: shopifyProductId });
-      const shelfLifeDays = apiResponse?.data?.product?.shelfLife?.value;
-      if (shelfLifeDays) {
-        const today = new Date();
-        today.setDate(today.getDate() + parseInt(shelfLifeDays, 10));
-        finalExpiryDate = today.toISOString().split('T')[0];
-      }
-    }
-
-    const insBatch = await client.query(
-      `INSERT INTO batches (product_id, batch_number, expiry_date, quantity) VALUES ($1, $2, $3, $4) RETURNING *;`,
-      [internalProductId, batchNumber, finalExpiryDate, parseInt(quantity, 10)]
-    );
-
-    await client.query('COMMIT');
-    res.status(201).json({ message: 'Charge erfolgreich erstellt.', batch: insBatch.rows[0] });
-  } catch (error) {
-    await client.query('ROLLBACK');
-    console.error('Fehler beim Erstellen der Charge:', error?.response?.data || error.message);
-    if (error.code === '23505') {
-      return res.status(409).json({ message: 'Diese Chargennummer existiert bereits.' });
-    }
-    res.status(500).json({ message: 'Interner Serverfehler' });
-  } finally {
-    client.release();
-  }
-});
-
-// GET /api/batches – inkl. shopify_product_id
-apiRouter.get('/batches', async (req, res) => {
-  try {
-    const q = `
-      SELECT
-        b.id,
-        b.batch_number,
-        b.expiry_date,
-        b.quantity,
-        b.created_at,
-        p.name  AS product_name,
-        p.sku   AS sku,
-        p.shopify_product_id
-      FROM batches b
-      JOIN products p ON p.id = b.product_id
-      ORDER BY b.created_at DESC, b.id DESC;
-    `;
-    const { rows } = await pool.query(q);
-    return res.json(rows);
-  } catch (error) {
-    console.error('Fehler beim Laden der Chargen:', error);
-    return res.status(500).json({ message: 'Interner Serverfehler' });
-  }
-});
-
-// PUT /api/batches/:id
-apiRouter.put('/batches/:id', async (req, res) => {
-  const { id } = req.params;
-  const { expiryDate, quantity } = req.body || {};
-
-  try {
-    const q = `
-      UPDATE batches
-         SET expiry_date = $1,
-             quantity    = $2
-       WHERE id = $3
-   RETURNING *;
-    `;
-    const { rows } = await pool.query(q, [expiryDate || null, Number.parseInt(quantity, 10) || 0, id]);
-    if (!rows.length) return res.status(404).json({ message: 'Charge nicht gefunden.' });
-    return res.json({ message: 'Charge aktualisiert.', batch: rows[0] });
-  } catch (error) {
-    console.error('Fehler beim Aktualisieren der Charge:', error);
-    if (error.code === '23505') {
-      return res.status(409).json({ message: 'Diese Chargennummer existiert bereits.' });
-    }
-    return res.status(500).json({ message: 'Interner Serverfehler' });
-  }
-});
-
-// DELETE /api/batches/:id – nur wenn keine Orders existieren
-apiRouter.delete('/batches/:id', async (req, res) => {
-  const { id } = req.params;
-  try {
-    const check = await pool.query('SELECT 1 FROM order_line_items WHERE batch_id = $1 LIMIT 1;', [id]);
-    if (check.rows.length > 0) {
-      return res.status(409).json({ message: 'Löschen nicht möglich: Für diese Charge existieren bereits Bestellungen.' });
-    }
-    const del = await pool.query('DELETE FROM batches WHERE id = $1 RETURNING *;', [id]);
-    if (!del.rows.length) return res.status(404).json({ message: 'Charge nicht gefunden.' });
-    return res.json({ message: 'Charge gelöscht.' });
-  } catch (error) {
-    console.error('Fehler beim Löschen der Charge:', error);
-    return res.status(500).json({ message: 'Interner Serverfehler' });
-  }
-});
-
-// GET /api/orders/batch/:batchNumber – Rückverfolgung
-apiRouter.get('/orders/batch/:batchNumber', async (req, res) => {
-  const { batchNumber } = req.params;
-  try {
-    const q = `
-      SELECT o.shopify_order_id AS "orderId",
-             o.customer_name     AS "customer",
-             o.order_date        AS "date",
-             p.name              AS "productName",
-             li.quantity         AS "quantity"
-        FROM orders o
-        JOIN order_line_items li ON o.id = li.order_id
-        JOIN batches b           ON li.batch_id = b.id
-        JOIN products p          ON li.product_id = p.id
-       WHERE b.batch_number = $1
-       ORDER BY o.order_date DESC, o.id DESC;
-    `;
-    const { rows } = await pool.query(q, [batchNumber]);
-    if (!rows.length) return res.status(404).json({ message: `Keine Bestellungen für Charge ${batchNumber} gefunden.` });
-    return res.json({ batchNumber, orders: rows });
-  } catch (error) {
-    console.error('Fehler bei /orders/batch/:batchNumber', error);
-    return res.status(500).json({ message: 'Interner Serverfehler' });
-  }
-});
-
-// POST /api/orders – geschützt; nutzt dieselbe Logik wie Webhook
-apiRouter.post('/orders', async (req, res) => {
-  const { shop } = req;
-  try {
-    await processOrder(shop, req.body);
-    return res.status(201).json({ message: 'Bestellung verarbeitet.' });
-  } catch (error) {
-    console.error('Fehler bei /api/orders:', error?.response?.data || error.message);
-    return res.status(500).json({ message: 'Interner Serverfehler' });
-  }
-});
-
-// Mount der API
-app.use('/api', apiRouter);
-
-// Healthcheck
-app.get('/', (req, res) => res.status(200).send('Backend mit Webhook orders/create ist aktiv.'));
-app.listen(port, () => console.log(`Server läuft auf Port ${port}`));
+export default MyApp;

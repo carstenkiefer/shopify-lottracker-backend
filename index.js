@@ -56,6 +56,56 @@ const verifyShopifySession = (req, res, next) => {
 };
 apiRouter.use(verifyShopifySession);
 
+// GraphQL-Proxy: /api/graphql
+apiRouter.post('/graphql', async (req, res) => {
+  try {
+    const { query, variables } = req.body || {};
+    if (!query) {
+      return res.status(400).json({ message: 'Missing GraphQL query.' });
+    }
+
+    // Access-Token des Shops aus DB holen
+    const { rows } = await pool.query(
+      'SELECT access_token FROM installations WHERE shop = $1 LIMIT 1',
+      [req.shop] // kommt aus verifyShopifySession → decoded.dest hostname
+    );
+    if (!rows.length) {
+      return res.status(403).json({ message: `No installation for shop ${req.shop}` });
+    }
+    const accessToken = rows[0].access_token;
+
+    // An Shopify GraphQL Admin API weiterleiten
+    const apiVersion = '2023-10'; // ggf. anheben
+    const url = `https://${req.shop}/admin/api/${apiVersion}/graphql.json`;
+
+    const rsp = await axios.post(
+      url,
+      { query, variables: variables || {} },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Shopify-Access-Token': accessToken,
+        },
+        timeout: 15000,
+      }
+    );
+
+    return res.status(200).json(rsp.data);
+  } catch (err) {
+    if (err.response) {
+      const status = err.response.status || 500;
+      return res.status(status).json(
+        typeof err.response.data === 'object'
+          ? err.response.data
+          : { message: 'Upstream error', data: err.response.data }
+      );
+    }
+    console.error('GraphQL proxy error:', err.message);
+    return res.status(500).json({ message: 'GraphQL proxy failed', error: err.message });
+  }
+});
+
+
 /**
  * POST /api/batches
  * Erstellt eine neue Charge. Holt sich das Standard-MHD aus den Shopify-Metafeldern, wenn keines angegeben ist.

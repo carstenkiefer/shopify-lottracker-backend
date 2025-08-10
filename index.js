@@ -6,47 +6,20 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const axios = require('axios');
 
-// --- Konfiguration ---
 const app = express();
 const port = process.env.PORT || 3000;
 const { SHOPIFY_API_KEY, SHOPIFY_API_SECRET, DATABASE_URL } = process.env;
 
-// --- Middleware ---
 app.use(cors());
 app.use(express.json());
 
-// --- Datenbank-Verbindung ---
+// --- DB-Verbindung ---
 const pool = new Pool({
     connectionString: DATABASE_URL,
     ssl: { rejectUnauthorized: false }
 });
 
-// --- SQL-Struktur ---
-/*
--- WICHTIGE ÄNDERUNG: Die Spalten für Haltbarkeit und Menge werden aus unserer DB entfernt.
--- Diese Daten leben jetzt als Metafelder direkt in Shopify.
--- Stellen Sie sicher, dass Ihre `products`-Tabelle diese einfache Struktur hat.
-
-CREATE TABLE IF NOT EXISTS products (
-    id SERIAL PRIMARY KEY,
-    shopify_product_id VARCHAR(255) UNIQUE NOT NULL,
-    name VARCHAR(255) NOT NULL,
-    sku VARCHAR(100),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
--- Stellen Sie sicher, dass auch die anderen Tabellen existieren:
-CREATE TABLE IF NOT EXISTS installations ( ... );
-CREATE TABLE IF NOT EXISTS batches ( ... );
-CREATE TABLE IF NOT EXISTS orders ( ... );
-CREATE TABLE IF NOT EXISTS order_line_items ( ... );
-*/
-
-// --- Authentifizierungs-Logik (Öffentliche Routen) ---
-// ... (Der Code für /api/auth und /api/auth/callback bleibt unverändert) ...
-
-
-// --- Hilfsfunktion für Shopify API-Aufrufe ---
+// --- Shopify API Helper ---
 const makeShopifyApiCall = async (shop, query) => {
     const dbResult = await pool.query('SELECT access_token FROM installations WHERE shop = $1', [shop]);
     if (dbResult.rows.length === 0) {
@@ -64,11 +37,9 @@ const makeShopifyApiCall = async (shop, query) => {
     return response.data;
 };
 
-
-// --- Geschützte API-Endpunkte ---
-
+// --- Middleware ---
 const apiRouter = express.Router();
-const verifyShopifySession = (req, res, next) => {DROP Table products;
+const verifyShopifySession = (req, res, next) => {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
         return res.status(401).send({ message: 'Unauthorized: No token provided.' });
@@ -77,7 +48,7 @@ const verifyShopifySession = (req, res, next) => {DROP Table products;
     try {
         const decoded = jwt.decode(token);
         if (!decoded || !decoded.dest) throw new Error('Invalid token');
-        req.shop = decoded.dest.replace('https://', ''); // Shop-Domain für API-Aufrufe verfügbar machen
+        req.shop = decoded.dest.replace('https://', '');
         next();
     } catch (error) {
         return res.status(401).send({ message: 'Unauthorized: Invalid token.' });
@@ -85,14 +56,13 @@ const verifyShopifySession = (req, res, next) => {DROP Table products;
 };
 apiRouter.use(verifyShopifySession);
 
-
 /**
  * POST /api/batches
  * Erstellt eine neue Charge. Holt sich das Standard-MHD aus den Shopify-Metafeldern, wenn keines angegeben ist.
  */
 apiRouter.post('/batches', async (req, res) => {
     const { shopifyProductId, productName, productSku, batchNumber, expiryDate, quantity } = req.body;
-    const { shop } = req; // Shop-Domain aus der Middleware
+    const { shop } = req;
 
     if (!shopifyProductId || !batchNumber || !quantity) {
         return res.status(400).json({ message: 'Shopify Produkt-ID, Chargennummer und Menge sind erforderlich.' });
@@ -101,14 +71,17 @@ apiRouter.post('/batches', async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
-        
+
         let productResult = await client.query('SELECT id FROM products WHERE shopify_product_id = $1', [shopifyProductId]);
         let internalProductId;
 
         if (productResult.rows.length > 0) {
             internalProductId = productResult.rows[0].id;
         } else {
-            const newProductResult = await client.query(`INSERT INTO products (shopify_product_id, name, sku) VALUES ($1, $2, $3) RETURNING id;`, [shopifyProductId, productName, productSku]);
+            const newProductResult = await client.query(
+                `INSERT INTO products (shopify_product_id, name, sku) VALUES ($1, $2, $3) RETURNING id;`,
+                [shopifyProductId, productName, productSku]
+            );
             internalProductId = newProductResult.rows[0].id;
         }
 
@@ -150,10 +123,107 @@ apiRouter.post('/batches', async (req, res) => {
     }
 });
 
+/**
+ * 📌 NEU: Alle Chargen abrufen
+ */
+apiRouter.get('/batches', async (req, res) => {
+    try {
+        const query = `
+            SELECT b.id, b.batch_number, b.expiry_date, b.quantity,
+                   p.name AS product_name, p.sku
+            FROM batches b
+            JOIN products p ON b.product_id = p.id
+            ORDER BY b.created_at DESC;
+        `;
+        const result = await pool.query(query);
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Fehler beim Abrufen der Chargen:', error.message);
+        res.status(500).json({ message: 'Interner Serverfehler' });
+    }
+});
+
+/**
+ * 📌 NEU: Charge bearbeiten
+ */
+apiRouter.put('/batches/:id', async (req, res) => {
+    const { id } = req.params;
+    const { expiryDate, quantity } = req.body;
+    try {
+        const updateQuery = `
+            UPDATE batches
+            SET expiry_date = $1, quantity = $2
+            WHERE id = $3
+            RETURNING *;
+        `;
+        const result = await pool.query(updateQuery, [expiryDate, quantity, id]);
+        if (result.rows.length === 0) {
+            return res.status(404).json({ message: 'Charge nicht gefunden.' });
+        }
+        res.json({ message: 'Charge aktualisiert.', batch: result.rows[0] });
+    } catch (error) {
+        console.error('Fehler beim Bearbeiten der Charge:', error.message);
+        res.status(500).json({ message: 'Interner Serverfehler' });
+    }
+});
+
+/**
+ * 📌 NEU: Charge löschen (nur wenn keine Bestellungen vorhanden)
+ */
+apiRouter.delete('/batches/:id', async (req, res) => {
+    const { id } = req.params;
+    try {
+        const checkOrders = await pool.query(
+            'SELECT COUNT(*) FROM order_line_items WHERE batch_id = $1',
+            [id]
+        );
+        if (parseInt(checkOrders.rows[0].count, 10) > 0) {
+            return res.status(400).json({ message: 'Charge kann nicht gelöscht werden, da Bestellungen vorhanden sind.' });
+        }
+        const delResult = await pool.query('DELETE FROM batches WHERE id = $1 RETURNING *', [id]);
+        if (delResult.rows.length === 0) {
+            return res.status(404).json({ message: 'Charge nicht gefunden.' });
+        }
+        res.json({ message: 'Charge erfolgreich gelöscht.' });
+    } catch (error) {
+        console.error('Fehler beim Löschen der Charge:', error.message);
+        res.status(500).json({ message: 'Interner Serverfehler' });
+    }
+});
+
+/**
+ * 📌 NEU: Bestellungen zu einer Charge abrufen
+ */
+apiRouter.get('/orders/batch/:batchNumber', async (req, res) => {
+    const { batchNumber } = req.params;
+    try {
+        const query = `
+            SELECT o.shopify_order_id AS "orderId",
+                   o.customer_name AS "customer",
+                   o.order_date AS "date",
+                   p.name AS "productName",
+                   li.quantity
+            FROM orders o
+            JOIN order_line_items li ON o.id = li.order_id
+            JOIN batches b ON li.batch_id = b.id
+            JOIN products p ON li.product_id = p.id
+            WHERE b.batch_number = $1;
+        `;
+        const result = await pool.query(query, [batchNumber]);
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ message: `Keine Bestellungen für Charge ${batchNumber} gefunden.` });
+        }
+        res.json({ batchNumber, orders: result.rows });
+    } catch (error) {
+        console.error('Fehler bei /orders/batch/:batchNumber', error);
+        res.status(500).json({ message: 'Interner Serverfehler' });
+    }
+});
 
 /**
  * POST /api/orders
- * Ordnet Chargen automatisch zu und legt bei Bedarf neue an, basierend auf Shopify-Metafeldern.
+ * Ordnet Chargen automatisch zu und legt bei Bedarf neue an (bestehende Funktion).
  */
 apiRouter.post('/orders', async (req, res) => {
     const { shopifyOrderId, customerName, orderDate, lineItems } = req.body;
@@ -167,16 +237,24 @@ apiRouter.post('/orders', async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        const orderResult = await client.query(`INSERT INTO orders (shopify_order_id, customer_name, order_date) VALUES ($1, $2, $3) RETURNING id;`, [shopifyOrderId, customerName, orderDate]);
+        const orderResult = await client.query(
+            `INSERT INTO orders (shopify_order_id, customer_name, order_date) VALUES ($1, $2, $3) RETURNING id;`,
+            [shopifyOrderId, customerName, orderDate]
+        );
         const newOrderId = orderResult.rows[0].id;
 
         for (const item of lineItems) {
             let quantityToFulfill = item.quantity;
-            let productInfo = await client.query('SELECT id, sku FROM products WHERE shopify_product_id = $1', [item.shopifyProductId]);
-            
+            let productInfo = await client.query(
+                'SELECT id, sku FROM products WHERE shopify_product_id = $1',
+                [item.shopifyProductId]
+            );
+
             if (productInfo.rows.length === 0) {
-                 // Produkt in unserer DB anlegen, falls es durch einen anderen Prozess noch nicht existiert
-                const newProductResult = await client.query(`INSERT INTO products (shopify_product_id, name, sku) VALUES ($1, $2, $3) RETURNING id, sku;`, [item.shopifyProductId, item.productName, item.productSku]);
+                const newProductResult = await client.query(
+                    `INSERT INTO products (shopify_product_id, name, sku) VALUES ($1, $2, $3) RETURNING id, sku;`,
+                    [item.shopifyProductId, item.productName, item.productSku]
+                );
                 productInfo = newProductResult;
             }
             const internalProductId = productInfo.rows[0].id;
@@ -196,7 +274,6 @@ apiRouter.post('/orders', async (req, res) => {
             }
 
             if (quantityToFulfill > 0) {
-                // Wenn Ware fehlt, Metafelder von Shopify abrufen
                 const query = `
                     query {
                         product(id: "${item.shopifyProductId}") {
@@ -211,7 +288,7 @@ apiRouter.post('/orders', async (req, res) => {
 
                 const now = new Date();
                 const newBatchNumber = `${productSku || 'PROD'}-${now.getFullYear()}${(now.getMonth() + 1).toString().padStart(2, '0')}${now.getDate().toString().padStart(2, '0')}-${now.getTime()}`;
-                
+
                 let newExpiryDate = null;
                 if (shelfLifeDays) {
                     now.setDate(now.getDate() + parseInt(shelfLifeDays, 10));
@@ -219,7 +296,10 @@ apiRouter.post('/orders', async (req, res) => {
                 }
 
                 const newBatchQuantity = defaultBatchQuantity ? parseInt(defaultBatchQuantity, 10) : 100;
-                const newBatchResult = await client.query('INSERT INTO batches (product_id, batch_number, expiry_date, quantity) VALUES ($1, $2, $3, $4) RETURNING id', [internalProductId, newBatchNumber, newExpiryDate, newBatchQuantity]);
+                const newBatchResult = await client.query(
+                    'INSERT INTO batches (product_id, batch_number, expiry_date, quantity) VALUES ($1, $2, $3, $4) RETURNING id',
+                    [internalProductId, newBatchNumber, newExpiryDate, newBatchQuantity]
+                );
                 const newBatchId = newBatchResult.rows[0].id;
 
                 await client.query('UPDATE batches SET quantity = quantity - $1 WHERE id = $2', [quantityToFulfill, newBatchId]);
@@ -238,7 +318,8 @@ apiRouter.post('/orders', async (req, res) => {
     }
 });
 
-
 app.use('/api', apiRouter);
-app.get('/', (req, res) => res.status(200).send('Batch Tracking Backend (v7 - Metafields) is running.'));
-app.listen(port, () => console.log(`Backend (v7) läuft auf Port ${port}.`));
+
+// --- Health Check ---
+app.get('/', (req, res) => res.status(200).send('Batch Tracking Backend mit Chargenverwaltung läuft.'));
+app.listen(port, () => console.log(`Backend läuft auf Port ${port}`));
